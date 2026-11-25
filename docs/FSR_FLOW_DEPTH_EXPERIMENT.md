@@ -60,7 +60,7 @@ with each other in a 3×3 tap neighbourhood but the generated frame differs, the
 the real frames' average. It targets a screen-still third-person character losing parts of
 its outline to the background during 30 fps camera turns, which FSR 4 ML, RIFE 4.26 and AMD
 FRC all showed on the same capture. SDR output and FSR graph FG only. Known limit: objects
-smaller than their per-frame displacement over plain areas are removed from generated frames.
+smaller than their per-frame displacement over plain areas were removed by the first two versions; two tests against the FG motion now gate the repair (see the shader header).
 
 ## Related experiment: per-region pair check
 
@@ -71,3 +71,18 @@ the current real frame instead of the generated one. Observed case: a character 
 past the camera during a spin, where FSR 4 ML produced a see-through blend of two unrelated
 pictures. Thresholds are untuned; fast motion beyond the search range also falls back to
 the real frame.
+
+## Related experiment: occlusion fill beside static foreground
+
+`VEYRA_TEST_FG_OCCLUSION_FILL=1` (off by default; `2` also tints filled pixels green) adds
+a second rule to the same compose pass. During a pan the background passes behind a
+screen-still character; in the strip beside the character one real frame still shows that
+background and the other already shows the character, and FSR 4 ML drew a dark ragged smear
+there on 30 fps capture. For the pixel's own FG motion and eight neighbours' (at least ten
+tap spacings long), the pixel takes the previous frame's sample half a motion back when
+that sample's surroundings follow the motion and the current frame's sample half a motion
+forward lies on static foreground (static between the real frames, own motion different,
+not explainable as background moving by that motion), and the mirrored case from the
+current frame. Static pixels are never touched. SDR output, FSR graph FG with flow only.
+Prototyped offline on recorded frames with a different optical flow (OpenCV DIS, also
+degraded to 8- and 16-pixel blocks); not yet confirmed on live capture.

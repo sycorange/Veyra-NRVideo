@@ -912,6 +912,10 @@ bool EnhanceGraph::initialize(const EnhanceGraphDesc& desc)
     wchar_t pairCheck[4]{};
     fgPairCheck_=fsrEnabled()&&fgEnabled_&&!desc_.hdrOutput&&
         GetEnvironmentVariableW(L"VEYRA_TEST_FG_PAIR_CHECK",pairCheck,4)>0&&pairCheck[0]==L'1';
+    wchar_t occlusionFill[4]{};
+    fgOcclusionFill_=0;
+    if(fsrEnabled()&&fgEnabled_&&!desc_.hdrOutput&&desc_.fgUsesFlow()&&GetEnvironmentVariableW(L"VEYRA_TEST_FG_OCCLUSION_FILL",occlusionFill,4)>0)
+        fgOcclusionFill_=occlusionFill[0]==L'1'?1u:occlusionFill[0]==L'2'?2u:0u;
     uint64_t budget=0,usage=0;
     // Every NR layer allocates its own full set of textures, and a stabilised
     // layer adds two history/guide pairs on top. The stack is bounded (16 nodes),
@@ -1287,14 +1291,14 @@ bool EnhanceGraph::createResources()
             fsrFlowDepth_=false;fsrFlowDepthTex_.Reset();fsrDepthHistogram_.Reset();fsrDepthDominant_.Reset();
         }
     }
-    if(fgStaticRepair_||fgPairCheck_){
+    if(fgComposeActive()){
         // The compose pass always binds the pair-error texture, so all three exist together.
         fgStaticRepairScratch_=makeTexture(context_.device(),workW_,workH_,outputFormat(),true);
         fgPairLuma_=makeTexture(context_.device(),128,144,DXGI_FORMAT_R32_FLOAT,true);
         fgPairError_=makeTexture(context_.device(),16,8,DXGI_FORMAT_R32_FLOAT,true);
         if(!fgStaticRepairScratch_||!fgPairLuma_||!fgPairError_){
-            veyra::log::warn("fg-static-repair","texture allocation failed; repair and pair check disabled");
-            fgStaticRepair_=0;fgPairCheck_=false;
+            veyra::log::warn("fg-static-repair","texture allocation failed; repair, fill and pair check disabled");
+            fgStaticRepair_=0;fgOcclusionFill_=0;fgPairCheck_=false;
         }
     }
     // Valid placeholder descriptors keep disabled FG inexpensive. Enabling it
@@ -1862,7 +1866,7 @@ void EnhanceGraph::composeHudLock(ID3D12GraphicsCommandList* list,unsigned gener
 }
 
 void EnhanceGraph::composeStaticRepair(ID3D12GraphicsCommandList* list,unsigned generatedSlot,unsigned parity){
-    if((!fgStaticRepair_&&!fgPairCheck_)||!list||parity>1||generatedSlot!=parity)return;
+    if(!fgComposeActive()||!list||parity>1||generatedSlot!=parity)return;
     auto* generated=genFrame_[generatedSlot].Get();
     auto* current=videoFrame_[parity].Get();
     auto* previous=videoFrame_[1-parity].Get();
@@ -1890,7 +1894,8 @@ void EnhanceGraph::composeStaticRepair(ID3D12GraphicsCommandList* list,unsigned 
     // SDR code values: real frames within 0.02 are static (0.05: moving); the generated
     // frame must deviate by 0.03..0.08 beyond twice that difference.
     const uint32_t spacing=std::max(1u,workH_/540u);
-    const float c[8]={uintBits(workW_),uintBits(workH_),uintBits(spacing),uintBits(fgStaticRepair_==2?1u:0u),fgStaticRepair_?1.f:0.f,fgPairCheck_?1.f:0.f,0,0};
+    const bool tint=fgStaticRepair_==2||fgOcclusionFill_==2;
+    const float c[8]={uintBits(workW_),uintBits(workH_),uintBits(spacing),uintBits(tint?1u:0u),fgStaticRepair_?1.f:0.f,fgPairCheck_?1.f:0.f,fgOcclusionFill_?1.f:0.f,0};
     const UINT base=generatedSlot*6;
     fgStaticRepairPass_.bind(list,c,gpuHandleOf(fgStaticRepairPass_,base).ptr,gpuHandleOf(fgStaticRepairPass_,base+5).ptr);
     list->Dispatch((workW_+15)/16,(workH_+15)/16,1);
@@ -1906,8 +1911,8 @@ void EnhanceGraph::composeStaticRepair(ID3D12GraphicsCommandList* list,unsigned 
     tracker_.transition(list,repairMotion,D3D12_RESOURCE_STATE_COMMON);
     if(!fgStaticRepairLogged_){
         fgStaticRepairLogged_=true;
-        veyra::log::info("fg-static-repair",std::format("active extent={}x{} spacing={} repair={} tint={} pairCheck={} (experimental, VEYRA_TEST_FG_STATIC_REPAIR / VEYRA_TEST_FG_PAIR_CHECK)",
-            workW_,workH_,spacing,fgStaticRepair_!=0,fgStaticRepair_==2,fgPairCheck_));
+        veyra::log::info("fg-static-repair",std::format("active extent={}x{} spacing={} repair={} occlusionFill={} tint={} pairCheck={} (experimental, VEYRA_TEST_FG_STATIC_REPAIR / VEYRA_TEST_FG_OCCLUSION_FILL / VEYRA_TEST_FG_PAIR_CHECK)",
+            workW_,workH_,spacing,fgStaticRepair_!=0,fgOcclusionFill_!=0,tint,fgPairCheck_));
     }
 }
 
@@ -2601,11 +2606,11 @@ bool EnhanceGraph::createComputePasses()
     }
     // FgStaticRepair, per generated slot: 0 generated, 1 current real, 2 previous real,
     // 3 pair errors, 4 FG motion; 5 scratch. FgPairChange, per parity: 0 real frame; 1 luma, 2 errors.
-    if((fgStaticRepair_||fgPairCheck_)&&
+    if(fgComposeActive()&&
        (!fgStaticRepairPass_.loadShader("FgStaticRepair.dxil",cs)||!fgStaticRepairPass_.create(context_.device(),cs,12,5,1)||
         !fgPairPass_.loadShader("FgPairChange.dxil",cs)||!fgPairPass_.create(context_.device(),cs,6,1,2))){
-        veyra::log::warn("fg-static-repair","pass unavailable; repair and pair check disabled");
-        fgStaticRepair_=0;fgPairCheck_=false;fgStaticRepairPass_={};fgPairPass_={};
+        veyra::log::warn("fg-static-repair","pass unavailable; repair, fill and pair check disabled");
+        fgStaticRepair_=0;fgOcclusionFill_=0;fgPairCheck_=false;fgStaticRepairPass_={};fgPairPass_={};
     }
     // Stage-5 output stabiliser. Only allocated when the setting is non-zero:
     // a default session never pays for it and the dispatch is skipped below, so
@@ -2835,7 +2840,7 @@ bool EnhanceGraph::createViews()
         makeUav(context_.device(),fsrDepthDominant_.Get(),DXGI_FORMAT_R32_UINT,cpu(fsrFlowDepthPass_,2));
         makeUav(context_.device(),fsrFlowDepthTex_.Get(),DXGI_FORMAT_R32_FLOAT,cpu(fsrFlowDepthPass_,3));
     }
-    if(fgStaticRepair_||fgPairCheck_){
+    if(fgComposeActive()){
         // FSR generates one frame per pair into slot == parity.
         for(UINT p=0;p<2;++p){
             stager_.stageSrv(genFrame_[p].Get(),nullptr,fgStaticRepairPass_.heap.Get(),p*6);
@@ -5448,7 +5453,7 @@ void EnhanceGraph::shutdown()
     fgFlowRefined_.Reset();fgFlowFilled_.Reset();fgBaseFlow_.Reset();flowRefinePass_={};flowFillPass_={};fgFlowAdaptPass_={};flowRefine_=flowConsistency_=false;
     fgFlowClaims_.Reset();fgFlowAgreement_.Reset();flowClaimPass_={};flowClaims_=false;
     fsrFlowDepthTex_.Reset();fsrDepthHistogram_.Reset();fsrDepthDominant_.Reset();fsrFlowDepthPass_={};fsrFlowDepth_=fsrFlowDepthLogged_=false;
-    fgStaticRepairScratch_.Reset();fgStaticRepairPass_={};fgStaticRepair_=0;fgStaticRepairLogged_=false;
+    fgStaticRepairScratch_.Reset();fgStaticRepairPass_={};fgStaticRepair_=0;fgOcclusionFill_=0;fgStaticRepairLogged_=false;
     fgPairLuma_.Reset();fgPairError_.Reset();fgPairPass_={};fgPairCheck_=false;
     for(unsigned i=0;i<kGeneratedPoolSlots;++i){if(fgDisableMapped_[i]&&fgDisableReadback_[i]){D3D12_RANGE written{0,0};fgDisableReadback_[i]->Unmap(0,&written);}fgDisableMapped_[i]=nullptr;fgDisable_[i].Reset();fgDisableReadback_[i].Reset();generatedLeases_[i].reset();genFrame_[i].Reset();}for(auto& lease:realLeases_)lease.reset();fgDisableInit_.Reset();
     encPass_ = ComputePass{};

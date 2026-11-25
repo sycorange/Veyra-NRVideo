@@ -1034,6 +1034,11 @@ private:
     bool fgPairCheck_=false;
     ComPtr<ID3D12Resource> fgPairLuma_,fgPairError_;
     ComputePass fgPairPass_;
+    // Experimental (VEYRA_TEST_FG_OCCLUSION_FILL=1, 2 = tint filled pixels green): beside a
+    // screen-static object the background passes behind during a pan, the same compose pass
+    // takes the background from the one real frame that still shows it. Needs FG flow. 0 = off.
+    unsigned fgOcclusionFill_=0;
+    bool fgComposeActive() const { return fgStaticRepair_!=0||fgOcclusionFill_!=0||fgPairCheck_; }
     void composeStaticRepair(ID3D12GraphicsCommandList* list,unsigned generatedSlot,unsigned parity);
     // The FG motion the repair tests against (work extent, current->previous pixels);
     // zero motion without flow, which leaves the repair inactive.

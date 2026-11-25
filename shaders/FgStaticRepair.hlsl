@@ -1,6 +1,7 @@
 // FgStaticRepair: experimental repair of a generated frame where both real frames agree
 // (VEYRA_TEST_FG_STATIC_REPAIR=1; 2 also tints the result for inspection: pink = repaired,
-// cyan = static evidence but left alone as a thin object over a plain area).
+// cyan = static evidence but left alone as a thin object over a plain area, green = filled,
+// yellow = real frame shown by the pair check).
 //
 // On 30 fps capture a camera turn moves the background far between two real frames while
 // a third-person character stays almost still on screen. Interpolators (FSR, RIFE, AMD
@@ -27,6 +28,16 @@
 // sweeping past the camera), the generated frame shows the current real frame instead of
 // a blend of two unrelated pictures (tinted yellow in the inspection view).
 //
+// With VEYRA_TEST_FG_OCCLUSION_FILL=1 (2 = tint green) the pass also fills the strip beside
+// a screen-static object that the background passes behind during a pan. Half a motion
+// one way that background is still visible in one real frame; half a motion the other way
+// the other real frame shows the static object instead, so an interpolator has only one
+// valid sample and was seen drawing a dark, ragged smear there. Where a nearby motion puts
+// one sample on confirmed static foreground (static between the real frames, its own
+// motion different, and not explainable as moving background) and the other sample on
+// background that follows the motion, the pixel takes the background sample. Prototyped
+// offline on recorded frames (docs/FSR_FLOW_DEPTH_EXPERIMENT.md); unproven on live capture.
+//
 // Known limits: nothing is repaired where no nearby motion is known, or where the static
 // part is narrower than the motion (the background really passes behind it in both frames).
 Texture2D<float4> generatedTex : register(t0);
@@ -44,7 +55,7 @@ cbuffer FgStaticRepairConstants : register(b0)
     uint debugView;    // 1: tint the result
     float repairOn;    // 1: static repair (thresholds live below while being tuned)
     float pairOn;      // 1: show the current real frame where the pair has no match
-    float unused2;
+    float fillOn;      // 1: occlusion fill beside static foreground
     float unused3;
 };
 
@@ -62,6 +73,10 @@ static const float kLegitHigh = 0.08;    // from here on it is explained by neit
 static const float kPairLow = 0.09;      // block best-match error where the real frame starts to show
 static const float kPairHigh = 0.15;     // and where it fully replaces the generated frame
 
+static const float kFillMinMotion = 10.0; // spacings; a shorter pan leaves no strip worth filling
+static const float kFillLow = 0.02;       // generated-frame deviation from the background sample where the fill starts
+static const float kFillHigh = 0.06;      // and where it is complete
+
 static const int2 kRing[8] = { int2(10, 0), int2(7, 7), int2(0, 10), int2(-7, 7), int2(-10, 0), int2(-7, -7), int2(0, -10), int2(7, -7) };
 
 float maxComponent(float3 v) { return max(v.x, max(v.y, v.z)); }
@@ -75,6 +90,23 @@ float patchDiff(Texture2D<float4> x, int2 px, Texture2D<float4> y, int2 py, int 
         sum += maxComponent(abs(x[clamp(px + o, int2(0, 0), limit)].rgb - y[clamp(py + o, int2(0, 0), limit)].rgb));
     }
     return sum / 9.0;
+}
+
+// Distance of the motion at q from m; unknown motion counts as far.
+float motionError(int2 q, float2 m)
+{
+    const float2 f = motionTex[q];
+    return all(isfinite(f)) ? length(f - m) : 1.0e6;
+}
+
+// 1 where the content at q is static between the real frames and is not background moving by fullMove.
+float staticForeground(int2 q, int2 fullMove, int step, int2 limit)
+{
+    const float still = 1.0 - smoothstep(kStaticLow, kStaticHigh, patchDiff(previousTex, q, currentTex, q, step, limit));
+    if (still <= 0.0) return 0.0;
+    const float notBackground = max(patchDiff(currentTex, q, previousTex, q + fullMove, step, limit),
+                                    patchDiff(previousTex, q, currentTex, q - fullMove, step, limit));
+    return still * smoothstep(kMoveLow, kMoveHigh, notBackground);
 }
 
 float pairError(int2 p)
@@ -129,13 +161,46 @@ void main(uint3 id : SV_DispatchThreadID)
         }
         w = evidence * smoothstep(kMoveLow, kMoveHigh, notBackground) * smoothstep(kLegitLow, kLegitHigh, explained);
     }
+    float fill = 0;
+    float3 fillColor = g.rgb;
+    const float moving = fillOn < 0.5 ? 0.0 : smoothstep(kStaticLow, kStaticHigh, still);
+    if (moving > 0) {
+        [loop] for (int n = 0; n < 9; ++n) {
+            const int2 q = n == 0 ? p : clamp(p + kRing[max(n - 1, 0)] * step * 3 / 2, int2(0, 0), limit);
+            const float2 m = motionTex[q];
+            if (!all(isfinite(m))) continue;
+            const float len = length(m);
+            if (len < kFillMinMotion * float(step)) continue;
+            const int2 fullMove = int2(round(m));
+            const int2 halfMove = int2(round(0.5 * m));
+            const int2 qa = p + halfMove;   // where this content is in the previous frame
+            const int2 qb = p - halfMove;   // and in the current frame
+            if (any(qa < int2(0, 0)) || any(qa > limit) || any(qb < int2(0, 0)) || any(qb > limit)) continue;
+            const float ea = motionError(qa, m);
+            const float eb = motionError(qb, m);
+            const float tolerance = 0.15 * len + 0.5 * float(step);
+            const float fromPrevious = moving * (1.0 - smoothstep(tolerance, 2.0 * tolerance, ea)) * smoothstep(0.25, 0.5, eb / len);
+            const float fromCurrent = moving * (1.0 - smoothstep(tolerance, 2.0 * tolerance, eb)) * smoothstep(0.25, 0.5, ea / len);
+            if (max(fromPrevious, fromCurrent) <= fill) continue;
+            const float fa = staticForeground(qa, fullMove, step, limit);
+            const float fb = staticForeground(qb, fullMove, step, limit);
+            float wa = fromPrevious * fb * (1.0 - fa);
+            if (wa > fill) wa *= smoothstep(kFillLow, kFillHigh, patchDiff(generatedTex, p, previousTex, qa, step, limit));
+            if (wa > fill) { fill = wa; fillColor = previousTex[qa].rgb; }
+            float wb = fromCurrent * fa * (1.0 - fb);
+            if (wb > fill) wb *= smoothstep(kFillLow, kFillHigh, patchDiff(generatedTex, p, currentTex, qb, step, limit));
+            if (wb > fill) { fill = wb; fillColor = currentTex[qb].rgb; }
+        }
+    }
     const float3 real = 0.5 * (previousTex[p].rgb + currentTex[p].rgb);
     float3 result = lerp(g.rgb, real, w);
+    result = lerp(result, fillColor, fill);
     const float replaced = pairOn < 0.5 ? 0.0 : smoothstep(kPairLow, kPairHigh, pairError(p));
     result = lerp(result, currentTex[p].rgb, replaced);
     if (debugView != 0) {
         result = lerp(result, float3(1.0, 0.0, 1.0), 0.6 * w);
         result = lerp(result, float3(0.0, 1.0, 1.0), 0.6 * (evidence - w));
+        result = lerp(result, float3(0.0, 1.0, 0.0), 0.6 * fill);
         result = lerp(result, float3(1.0, 1.0, 0.0), 0.4 * replaced);
     }
     outputTex[p] = float4(result, g.a);
