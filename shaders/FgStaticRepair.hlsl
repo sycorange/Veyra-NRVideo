@@ -9,30 +9,38 @@
 // current real frame, but clearly different in the generated frame, takes the average of
 // the two real frames instead.
 //
-// A thin object crossing a plain area (a pole or wire against the sky, a road marking)
-// passes the same test: both real frames show the plain area where the generated frame
-// correctly draws the object. Such a pixel has static surroundings on every side, while a
-// character's outline borders the moving background. The repair therefore only acts near
-// the edge of a static region: some of the pixels on two rings around it must be moving.
+// The same test also fires on a thin scene detail crossing a self-similar surface (a lane
+// line on asphalt, a pole or wire against the sky, a shadow edge): both real frames show
+// the plain surface where the generated frame correctly draws the detail. The first two
+// versions removed such details from generated frames on real capture. Two further tests
+// with the frame-generation motion (current->previous pixels) of the pixel and of eight
+// neighbours now gate the repair:
+//  - the content at the pixel must not be explainable as moving background: with that
+//    motion, the previous frame there must differ from the current one (asphalt and sky
+//    look the same along the motion and never pass; a character's outline does);
+//  - the generated content must not be explained by both real frames along a motion
+//    (a correctly interpolated detail is: it is in the previous frame half a motion one
+//    way and in the current frame half a motion the other way).
 //
 // With VEYRA_TEST_FG_PAIR_CHECK=1 the pass also reads FgPairChange.hlsl's block errors:
 // where the previous frame's content has no match in the current one (a cut, a body
 // sweeping past the camera), the generated frame shows the current real frame instead of
 // a blend of two unrelated pictures (tinted yellow in the inspection view).
 //
-// Known limits: a thin object close to moving, textured content is still removed from the
-// generated frame; a character against a plain sky is not repaired.
+// Known limits: nothing is repaired where no nearby motion is known, or where the static
+// part is narrower than the motion (the background really passes behind it in both frames).
 Texture2D<float4> generatedTex : register(t0);
 Texture2D<float4> currentTex : register(t1);    // newer real frame
 Texture2D<float4> previousTex : register(t2);   // older real frame
 Texture2D<float> pairErrorTex : register(t3);   // 16 x 8 best-match errors (FgPairChange)
+Texture2D<float2> motionTex : register(t4);     // work extent, current->previous pixels
 RWTexture2D<float4> outputTex : register(u0);
 
 cbuffer FgStaticRepairConstants : register(b0)
 {
     uint width;
     uint height;
-    uint spacing;      // tap spacing in pixels (3x3 taps); rings at 10 and 20 spacings
+    uint spacing;      // tap spacing in pixels (3x3 taps); motion candidates 15 spacings away
     uint debugView;    // 1: tint the result
     float repairOn;    // 1: static repair (thresholds live below while being tuned)
     float pairOn;      // 1: show the current real frame where the pair has no match
@@ -45,8 +53,11 @@ static const float kStaticLow = 0.03;    // real-frame difference up to this is 
 static const float kStaticHigh = 0.08;   // from this on the pixel is moving: untouched
 static const float kDifferLow = 0.025;   // generated-frame deviation where the repair starts
 static const float kDifferHigh = 0.07;   // and where it is complete
-static const float kMovingLow = 0.12;    // share of moving ring pixels where the repair starts
-static const float kMovingHigh = 0.30;   // and where it is complete
+static const float kMinMotion = 3.0;     // candidate motions shorter than this many spacings are ignored
+static const float kMoveLow = 0.05;      // "is moving background" mismatch where the repair starts
+static const float kMoveHigh = 0.10;     // and where the pixel is surely not moving background
+static const float kLegitLow = 0.04;     // generated content matches both real frames up to here: keep it
+static const float kLegitHigh = 0.08;    // from here on it is explained by neither
 
 static const float kPairLow = 0.09;      // block best-match error where the real frame starts to show
 static const float kPairHigh = 0.15;     // and where it fully replaces the generated frame
@@ -54,6 +65,17 @@ static const float kPairHigh = 0.15;     // and where it fully replaces the gene
 static const int2 kRing[8] = { int2(10, 0), int2(7, 7), int2(0, 10), int2(-7, 7), int2(-10, 0), int2(-7, -7), int2(0, -10), int2(7, -7) };
 
 float maxComponent(float3 v) { return max(v.x, max(v.y, v.z)); }
+
+// Mean difference of the 3x3 tap patches of x around px and y around py.
+float patchDiff(Texture2D<float4> x, int2 px, Texture2D<float4> y, int2 py, int step, int2 limit)
+{
+    float sum = 0;
+    [unroll] for (int j = 0; j < 9; ++j) {
+        const int2 o = int2(j % 3 - 1, j / 3 - 1) * step;
+        sum += maxComponent(abs(x[clamp(px + o, int2(0, 0), limit)].rgb - y[clamp(py + o, int2(0, 0), limit)].rgb));
+    }
+    return sum / 9.0;
+}
 
 float pairError(int2 p)
 {
@@ -89,16 +111,23 @@ void main(uint3 id : SV_DispatchThreadID)
     const float evidence = repairOn < 0.5 ? 0.0 : (1.0 - smoothstep(kStaticLow, kStaticHigh, still)) * smoothstep(kDifferLow, kDifferHigh, differ - 1.5 * still);
     float w = 0;
     if (evidence > 0) {
-        float nearRing = 0;
-        float farRing = 0;
-        [unroll] for (int k = 0; k < 8; ++k) {
-            const int2 q1 = clamp(p + kRing[k] * step, int2(0, 0), limit);
-            const int2 q2 = clamp(p + kRing[k] * step * 2, int2(0, 0), limit);
-            nearRing += smoothstep(kStaticLow, kStaticHigh, maxComponent(abs(previousTex[q1].rgb - currentTex[q1].rgb)));
-            farRing += smoothstep(kStaticLow, kStaticHigh, maxComponent(abs(previousTex[q2].rgb - currentTex[q2].rgb)));
+        float notBackground = 0;   // largest mismatch of "the content here moves with a nearby motion"
+        float explained = 1.0;     // smallest two-sided error of the generated content along a motion
+        [loop] for (int k = 0; k < 9; ++k) {
+            const int2 q = k == 0 ? p : clamp(p + kRing[max(k - 1, 0)] * step * 3 / 2, int2(0, 0), limit);
+            const float2 m = motionTex[q];
+            if (!all(isfinite(m)) || length(m) < kMinMotion * float(step)) continue;
+            const int2 fullMove = int2(round(m));
+            const int2 halfMove = int2(round(0.5 * m));
+            notBackground = max(notBackground, max(patchDiff(currentTex, p, previousTex, p + fullMove, step, limit),
+                                                   patchDiff(previousTex, p, currentTex, p - fullMove, step, limit)));
+            const float forward = max(patchDiff(generatedTex, p, previousTex, p + halfMove, step, limit),
+                                      patchDiff(generatedTex, p, currentTex, p - halfMove, step, limit));
+            const float backward = max(patchDiff(generatedTex, p, previousTex, p - halfMove, step, limit),
+                                       patchDiff(generatedTex, p, currentTex, p + halfMove, step, limit));
+            explained = min(explained, min(forward, backward));
         }
-        const float moving = max(nearRing, farRing) / 8.0;
-        w = evidence * smoothstep(kMovingLow, kMovingHigh, moving);
+        w = evidence * smoothstep(kMoveLow, kMoveHigh, notBackground) * smoothstep(kLegitLow, kLegitHigh, explained);
     }
     const float3 real = 0.5 * (previousTex[p].rgb + currentTex[p].rgb);
     float3 result = lerp(g.rgb, real, w);

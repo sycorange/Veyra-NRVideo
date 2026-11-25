@@ -1035,6 +1035,12 @@ private:
     ComPtr<ID3D12Resource> fgPairLuma_,fgPairError_;
     ComputePass fgPairPass_;
     void composeStaticRepair(ID3D12GraphicsCommandList* list,unsigned generatedSlot,unsigned parity);
+    // The FG motion the repair tests against (work extent, current->previous pixels);
+    // zero motion without flow, which leaves the repair inactive.
+    ID3D12Resource* fgStaticRepairMotion() const {
+        auto* flow=desc_.fgUsesFlow()?fsrFlowDepthMotion():nullptr;
+        return flow?flow:nrZeroMotion_.Get();
+    }
     uint64_t motionPreviousSource_[2]={},previousSource_=0;
     ComPtr<ID3D12Resource> proxyTex_;
     ComPtr<ID3D12Resource> neuralTex_;
