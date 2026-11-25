@@ -3,3 +3,4 @@ build 6: static repair
 build 7: pair check
 build 8: motion-gated repair
 build 9: occlusion fill
+build 10: occlusion fill, guarded

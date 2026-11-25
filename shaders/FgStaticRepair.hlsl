@@ -35,8 +35,13 @@
 // valid sample and was seen drawing a dark, ragged smear there. Where a nearby motion puts
 // one sample on confirmed static foreground (static between the real frames, its own
 // motion different, and not explainable as moving background) and the other sample on
-// background that follows the motion, the pixel takes the background sample. Prototyped
-// offline on recorded frames (docs/FSR_FLOW_DEPTH_EXPERIMENT.md); unproven on live capture.
+// background that follows the motion, the pixel takes the background sample. The pixel
+// itself must be background moving by that motion, the generated frame must already show
+// the foreground at the foreground sample, and motions beyond 120 spacings are left alone.
+// Prototyped offline on recorded frames with a stand-in optical flow
+// (docs/FSR_FLOW_DEPTH_EXPERIMENT.md): it cleaned the smear in one fast turn, changed
+// little in three others and slightly hurt a second character behind the first in one.
+// Unproven on live capture.
 //
 // Known limits: nothing is repaired where no nearby motion is known, or where the static
 // part is narrower than the motion (the background really passes behind it in both frames).
@@ -74,6 +79,9 @@ static const float kPairLow = 0.09;      // block best-match error where the rea
 static const float kPairHigh = 0.15;     // and where it fully replaces the generated frame
 
 static const float kFillMinMotion = 10.0; // spacings; a shorter pan leaves no strip worth filling
+static const float kFillFadeMotion = 90.0; // spacings; longer motions are trusted less
+static const float kFillMaxMotion = 120.0; // and from here on nothing is filled
+static const float kFillAgree = 0.06;     // a sample follows the motion within this share of its length
 static const float kFillLow = 0.02;       // generated-frame deviation from the background sample where the fill starts
 static const float kFillHigh = 0.06;      // and where it is complete
 
@@ -171,6 +179,8 @@ void main(uint3 id : SV_DispatchThreadID)
             if (!all(isfinite(m))) continue;
             const float len = length(m);
             if (len < kFillMinMotion * float(step)) continue;
+            const float range = 1.0 - smoothstep(kFillFadeMotion * float(step), kFillMaxMotion * float(step), len);
+            if (range <= 0.0) continue;
             const int2 fullMove = int2(round(m));
             const int2 halfMove = int2(round(0.5 * m));
             const int2 qa = p + halfMove;   // where this content is in the previous frame
@@ -178,16 +188,23 @@ void main(uint3 id : SV_DispatchThreadID)
             if (any(qa < int2(0, 0)) || any(qa > limit) || any(qb < int2(0, 0)) || any(qb > limit)) continue;
             const float ea = motionError(qa, m);
             const float eb = motionError(qb, m);
-            const float tolerance = 0.15 * len + 0.5 * float(step);
-            const float fromPrevious = moving * (1.0 - smoothstep(tolerance, 2.0 * tolerance, ea)) * smoothstep(0.25, 0.5, eb / len);
-            const float fromCurrent = moving * (1.0 - smoothstep(tolerance, 2.0 * tolerance, eb)) * smoothstep(0.25, 0.5, ea / len);
+            const float tolerance = kFillAgree * len + 0.5 * float(step);
+            const float fromPrevious = moving * range * (1.0 - smoothstep(tolerance, 2.0 * tolerance, ea)) * smoothstep(0.25, 0.5, eb / len);
+            const float fromCurrent = moving * range * (1.0 - smoothstep(tolerance, 2.0 * tolerance, eb)) * smoothstep(0.25, 0.5, ea / len);
             if (max(fromPrevious, fromCurrent) <= fill) continue;
             const float fa = staticForeground(qa, fullMove, step, limit);
             const float fb = staticForeground(qb, fullMove, step, limit);
+            // Each side in turn: the generated frame shows that foreground too; this pixel is
+            // background that moved by m between the real frames; the generated frame differs
+            // from the background sample.
             float wa = fromPrevious * fb * (1.0 - fa);
+            if (wa > fill) wa *= 1.0 - smoothstep(kStaticLow, kStaticHigh, patchDiff(generatedTex, qb, previousTex, qb, step, limit));
+            if (wa > fill) wa *= 1.0 - smoothstep(kStaticLow, kStaticHigh, patchDiff(currentTex, p, previousTex, p + fullMove, step, limit));
             if (wa > fill) wa *= smoothstep(kFillLow, kFillHigh, patchDiff(generatedTex, p, previousTex, qa, step, limit));
             if (wa > fill) { fill = wa; fillColor = previousTex[qa].rgb; }
             float wb = fromCurrent * fa * (1.0 - fb);
+            if (wb > fill) wb *= 1.0 - smoothstep(kStaticLow, kStaticHigh, patchDiff(generatedTex, qa, currentTex, qa, step, limit));
+            if (wb > fill) wb *= 1.0 - smoothstep(kStaticLow, kStaticHigh, patchDiff(previousTex, p, currentTex, p - fullMove, step, limit));
             if (wb > fill) wb *= smoothstep(kFillLow, kFillHigh, patchDiff(generatedTex, p, currentTex, qb, step, limit));
             if (wb > fill) { fill = wb; fillColor = currentTex[qb].rgb; }
         }

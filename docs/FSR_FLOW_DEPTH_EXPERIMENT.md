@@ -83,6 +83,10 @@ tap spacings long), the pixel takes the previous frame's sample half a motion ba
 that sample's surroundings follow the motion and the current frame's sample half a motion
 forward lies on static foreground (static between the real frames, own motion different,
 not explainable as background moving by that motion), and the mirrored case from the
-current frame. Static pixels are never touched. SDR output, FSR graph FG with flow only.
-Prototyped offline on recorded frames with a different optical flow (OpenCV DIS, also
-degraded to 8- and 16-pixel blocks); not yet confirmed on live capture.
+current frame. The pixel itself must be background that moved by that motion, the generated
+frame must already show the foreground at the foreground sample, and motions beyond 120
+spacings are left alone. Static pixels are never touched. SDR output, FSR graph FG with
+flow only. Prototyped offline on five recorded fast-turn frames with a different optical
+flow (OpenCV DIS degraded to 8-pixel blocks): the smear was removed in one, three changed
+little, and in one a second character behind the first was slightly degraded. Not yet
+confirmed on live capture.
