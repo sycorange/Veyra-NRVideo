@@ -138,6 +138,26 @@ jobs:
           path: C:\vcache
           key: vcpkg-${{ env.VCPKG_COMMIT }}-${{ env.OVERLAY_HASH }}-v1
 
+      # The AMD optical-flow guidance (FidelityFX flow, the default flow on AMD) links the
+      # FidelityFX SDK 1.1.4 static libraries. Release builds have them locally; without
+      # them frame generation on AMD cannot start. Build the two libraries from AMD's
+      # public repository at the v1.1.4 commit (MIT), with the static CRT this project uses.
+      - name: Build AMD FidelityFX SDK 1.1.4 optical flow and DX12 backend (static)
+        run: |
+          $d = 'C:\ffx114'
+          git init -q $d
+          git -C $d remote add origin https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git
+          git -C $d fetch -q --depth 1 origin c6efa6bf7f2027b3ec94f28578bb5965eabb9e55
+          git -C $d -c advice.detachedHead=false checkout -q FETCH_HEAD
+          cmake -S "$d\sdk" -B "$d\sdk\build" -G "Visual Studio 17 2022" -A x64 `
+            -DFFX_API_BACKEND=DX12_X64 -DFFX_FSR3=ON -DFFX_OF=ON -DFFX_AUTO_COMPILE_SHADERS=1 `
+            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          cmake --build "$d\sdk\build" --config Release --parallel --target ffx_opticalflow_x64 ffx_backend_dx12_x64
+          Get-ChildItem "$d\sdk\bin\ffx_sdk" | Format-Table Name, Length
+          foreach ($lib in 'ffx_opticalflow_x64.lib', 'ffx_backend_dx12_x64.lib') {
+            if (-not (Test-Path "$d\sdk\bin\ffx_sdk\$lib")) { throw "$lib was not built" }
+          }
+
       - name: Configure (preset x64-release)
         run: |
           cmake --preset x64-release -B C:\b `
@@ -149,6 +169,7 @@ jobs:
             -DVEYRA_LIBDOVI_ROOT=C:/dovi `
             -DOPENSSL_USE_STATIC_LIBS=TRUE -DOPENSSL_MSVC_STATIC_RT=TRUE `
             -DOPENSSL_ROOT_DIR=C:/v/installed/x64-windows-static `
+            -DVEYRA_FIDELITYFX_ROOT=C:/ffx114/sdk `
             "-DCMAKE_PREFIX_PATH=$env:QT_ROOT_DIR"
 
       - name: Build veyra_qml_ui, virtual camera and shaders
