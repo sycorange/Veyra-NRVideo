@@ -887,6 +887,10 @@ bool EnhanceGraph::initialize(const EnhanceGraphDesc& desc)
     const bool occlusionCheck=flowRefine_&&!(GetEnvironmentVariableW(L"VEYRA_TEST_FLOW_CONSISTENCY",consistency,4)&&consistency[0]==L'0');
     flowConsistency_=occlusionCheck&&nvidiaFlow;
     flowClaims_=occlusionCheck&&fidelityFlow;
+    // Experimental FSR depth from FG motion; same-EXE A/B via the environment, default off.
+    wchar_t flowDepth[4]{};
+    fsrFlowDepth_=fsrEnabled()&&fgEnabled_&&desc_.fgUsesFlow()&&!desc_.fgMotionProbe&&
+        GetEnvironmentVariableW(L"VEYRA_TEST_FSR_FLOW_DEPTH",flowDepth,4)>0&&flowDepth[0]==L'1';
     uint64_t budget=0,usage=0;
     // Every NR layer allocates its own full set of textures, and a stabilised
     // layer adds two history/guide pairs on top. The stack is bounded (16 nodes),
@@ -1251,6 +1255,17 @@ bool EnhanceGraph::createResources()
     confTex_ = makeTexture(context_.device(), nvofW_, nvofH_, DXGI_FORMAT_R8_UNORM, true);
     flowTex_ = makeTexture(context_.device(), nvofW_, nvofH_, DXGI_FORMAT_R16G16_FLOAT, true);
     depthTex_ = makeTexture(context_.device(), workW_, workH_, DXGI_FORMAT_R32_FLOAT, false);
+    if(fsrFlowDepth_){
+        // FsrFlowDepth.hlsl: 64x64 motion bins (count, sum x, sum y rows) and a 4x1 result.
+        fsrFlowDepthTex_=makeTexture(context_.device(),workW_,workH_,DXGI_FORMAT_R32_FLOAT,true);
+        fsrDepthHistogram_=makeTexture(context_.device(),64,192,DXGI_FORMAT_R32_UINT,true);
+        fsrDepthDominant_=makeTexture(context_.device(),4,1,DXGI_FORMAT_R32_UINT,true);
+        if(!fsrFlowDepthTex_||!fsrDepthHistogram_||!fsrDepthDominant_){
+            // The experiment must never block FG: fall back to the constant depth.
+            veyra::log::warn("fsr-flow-depth","texture allocation failed; using the constant depth");
+            fsrFlowDepth_=false;fsrFlowDepthTex_.Reset();fsrDepthHistogram_.Reset();fsrDepthDominant_.Reset();
+        }
+    }
     // Valid placeholder descriptors keep disabled FG inexpensive. Enabling it
     // is a graph rebuild, so no in-flight descriptor is resized in place.
     for(size_t i=0;i<kGeneratedPoolSlots;++i){
@@ -2497,6 +2512,12 @@ bool EnhanceGraph::createComputePasses()
         if(!flowFillPass_.loadShader("FlowFill.dxil",cs)||!flowFillPass_.create(context_.device(),cs,4,3,1))return false;
         if(flowClaims_&&(!flowClaimPass_.loadShader("FlowClaim.dxil",cs)||!flowClaimPass_.create(context_.device(),cs,3,1,2)))return false;
     }
+    // FsrFlowDepth: 0 FG motion; 1 histogram, 2 dominant motion, 3 depth. A missing shader
+    // only disables the experiment (constant depth), never FG itself.
+    if(fsrFlowDepth_&&(!fsrFlowDepthPass_.loadShader("FsrFlowDepth.dxil",cs)||!fsrFlowDepthPass_.create(context_.device(),cs,4,1,3))){
+        veyra::log::warn("fsr-flow-depth","pass unavailable; using the constant depth");
+        fsrFlowDepth_=false;fsrFlowDepthPass_={};
+    }
     // Stage-5 output stabiliser. Only allocated when the setting is non-zero:
     // a default session never pays for it and the dispatch is skipped below, so
     // the disabled path stays byte-identical to a build without this pass.
@@ -2716,6 +2737,14 @@ bool EnhanceGraph::createViews()
         makeUav(context_.device(),fgFlowFilled_.Get(),DXGI_FORMAT_R16G16_FLOAT,cpu(flowFillPass_,3));
         stagedSrv(fgFlowFilled_.Get(),DXGI_FORMAT_R16G16_FLOAT,fgFlowAdaptPass_,0);
         makeUav(context_.device(),fgBaseFlow_.Get(),DXGI_FORMAT_R16G16_FLOAT,cpu(fgFlowAdaptPass_,1));
+    }
+    if(fsrFlowDepth_){
+        // Reads the FG motion before HUD protection's per-frame fix: one fixed resource,
+        // so the view is created once (HUD regions keep their own motion repair).
+        stagedSrv(fsrFlowDepthMotion(),DXGI_FORMAT_R16G16_FLOAT,fsrFlowDepthPass_,0);
+        makeUav(context_.device(),fsrDepthHistogram_.Get(),DXGI_FORMAT_R32_UINT,cpu(fsrFlowDepthPass_,1));
+        makeUav(context_.device(),fsrDepthDominant_.Get(),DXGI_FORMAT_R32_UINT,cpu(fsrFlowDepthPass_,2));
+        makeUav(context_.device(),fsrFlowDepthTex_.Get(),DXGI_FORMAT_R32_FLOAT,cpu(fsrFlowDepthPass_,3));
     }
     if(desc_.hdrWorking()&&videoSrInput_){
         stagedSrv(srcRgba_.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT,hdrVideoSrPass_,0);
@@ -4547,6 +4576,36 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
     }
     auto* fgMotion=desc_.fgMotionProbe?desc_.fgMotionProbe:
         haveFlow&&desc_.fgUsesFlow()?(flowRefine_?fgBaseFlow_.Get():baseFlow_.Get()):nrZeroMotion_.Get();
+    // FSR depth: the constant far depth unless the flow-depth experiment has this frame's flow.
+    ID3D12Resource* fgDepth=depthTex_.Get();
+    if(fsrFlowDepth_&&haveFlow&&!reset&&fgEnabled_){
+        auto* motionIn=fsrFlowDepthMotion();
+        tracker_.transition(list,motionIn,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        tracker_.transition(list,fsrDepthHistogram_.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        tracker_.transition(list,fsrDepthDominant_.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        tracker_.transition(list,fsrFlowDepthTex_.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        constexpr uint32_t step=4;   // one vote per 4x4 pixels
+        const auto run=[&](uint32_t mode,uint32_t groupsX,uint32_t groupsY){
+            // farDepth matches initZeroAndDepthTextures(); a frame without one dominant
+            // motion (at least 30% of votes) keeps exactly that constant.
+            const float c[8]={uintBits(workW_),uintBits(workH_),uintBits(mode),uintBits(step),.9f,.5f,.3f,0};
+            fsrFlowDepthPass_.bind(list,c,gpuHandleOf(fsrFlowDepthPass_,0).ptr,gpuHandleOf(fsrFlowDepthPass_,1).ptr);
+            list->Dispatch(groupsX,groupsY,1);
+            tracker_.uavBarrier(list,fsrDepthHistogram_.Get());tracker_.uavBarrier(list,fsrDepthDominant_.Get());
+        };
+        run(0,64/16,192/16);
+        run(1,((workW_+step-1)/step+15)/16,((workH_+step-1)/step+15)/16);
+        run(2,1,1);
+        run(3,(workW_+15)/16,(workH_+15)/16);
+        tracker_.uavBarrier(list,fsrFlowDepthTex_.Get());
+        tracker_.transition(list,fsrFlowDepthTex_.Get(),D3D12_RESOURCE_STATE_COMMON);
+        fgDepth=fsrFlowDepthTex_.Get();
+        if(!fsrFlowDepthLogged_){
+            fsrFlowDepthLogged_=true;
+            veyra::log::info("fsr-flow-depth",std::format("active extent={}x{} motion={} far=0.9 near=0.5 minShare=0.3 (experimental, VEYRA_TEST_FSR_FLOW_DEPTH=1)",
+                workW_,workH_,flowRefine_?"refined":"validated"));
+        }
+    }
     if(hudProtect_){
         const bool useFgFlow=haveFlow&&desc_.fgUsesFlow()&&!desc_.fgMotionProbe;
         hudProtect_->prepare(list,tracker_,gpuTimer_,parity,reset||!prevValid_,useFgFlow,ring_->fence());
@@ -4742,7 +4801,7 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
         auto* motion=fgMotion;
         tracker_.transition(flist,fgFrame,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         if(!desc_.fgMotionProbe)tracker_.transition(flist,motion,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        tracker_.transition(flist,depthTex_.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        tracker_.transition(flist,fgDepth,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         tracker_.transition(flist,genFrame_[generatedSlot].Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         if(!fsrFgBackend_){
         // One status resource for the whole input-frame pair, just like the
@@ -4754,7 +4813,7 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
         tracker_.transition(flist,fgDisable_[parity].Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
         ngx::DlssFgBackend::EvalDesc fe{};
-        fe.hdr=hdr10Output();fe.backbuffer=fgFrame; fe.depth=depthTex_.Get(); fe.mvecs=motion;
+        fe.hdr=hdr10Output();fe.backbuffer=fgFrame; fe.depth=fgDepth; fe.mvecs=motion;
         fe.outputInterpolated=genFrame_[generatedSlot].Get(); fe.reset=resetFg;
         fe.outputDisableInterpolation=fgDisable_[parity].Get();
         fe.multiFrameCount=fgCalls;fe.multiFrameIndex=sub;
@@ -4772,10 +4831,10 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
             // The SDK restores all externally registered textures to COMMON.
             tracker_.transition(flist,fgFrame,D3D12_RESOURCE_STATE_COMMON);
             tracker_.transition(flist,motion,D3D12_RESOURCE_STATE_COMMON);
-            tracker_.transition(flist,depthTex_.Get(),D3D12_RESOURCE_STATE_COMMON);
+            tracker_.transition(flist,fgDepth,D3D12_RESOURCE_STATE_COMMON);
             tracker_.transition(flist,genFrame_[generatedSlot].Get(),D3D12_RESOURCE_STATE_COMMON);
             const float interval=prevValid_&&ptsMs>prevPtsMs_?float(ptsMs-prevPtsMs_):16.6667f;
-            if(!fsrFgBackend_->generate(flist,fgFrame,motion,depthTex_.Get(),
+            if(!fsrFgBackend_->generate(flist,fgFrame,motion,fgDepth,
                     genFrame_[generatedSlot].Get(),resetFg,interval)){
                 failedBackend_=engine::FailedBackend::Fg;return false;
             }
@@ -4804,7 +4863,7 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
         composeExclusion(flist,generatedSlot+2,resetFg?parity:1-parity,false,true);
         tracker_.transition(flist,fgFrame,D3D12_RESOURCE_STATE_COMMON);
         tracker_.transition(flist,genFrame_[generatedSlot].Get(),D3D12_RESOURCE_STATE_COMMON);
-        tracker_.transition(flist,depthTex_.Get(),D3D12_RESOURCE_STATE_COMMON);
+        tracker_.transition(flist,fgDepth,D3D12_RESOURCE_STATE_COMMON);
         if(sub==fgCalls)gpuTimer_.resolve(flist);
         if(!submitGraph(slot))return false;
         if(sub==fgCalls)gpuTimer_.submitted(ring_->lastSignaledValue());
@@ -5284,6 +5343,7 @@ void EnhanceGraph::shutdown()
     residualRgba_.Reset();preSrProtectionRgba_.Reset();interNrProtectionRgba_.Reset();nrFlow_.Reset();baseFlow_.Reset();
     fgFlowRefined_.Reset();fgFlowFilled_.Reset();fgBaseFlow_.Reset();flowRefinePass_={};flowFillPass_={};fgFlowAdaptPass_={};flowRefine_=flowConsistency_=false;
     fgFlowClaims_.Reset();fgFlowAgreement_.Reset();flowClaimPass_={};flowClaims_=false;
+    fsrFlowDepthTex_.Reset();fsrDepthHistogram_.Reset();fsrDepthDominant_.Reset();fsrFlowDepthPass_={};fsrFlowDepth_=fsrFlowDepthLogged_=false;
     for(unsigned i=0;i<kGeneratedPoolSlots;++i){if(fgDisableMapped_[i]&&fgDisableReadback_[i]){D3D12_RANGE written{0,0};fgDisableReadback_[i]->Unmap(0,&written);}fgDisableMapped_[i]=nullptr;fgDisable_[i].Reset();fgDisableReadback_[i].Reset();generatedLeases_[i].reset();genFrame_[i].Reset();}for(auto& lease:realLeases_)lease.reset();fgDisableInit_.Reset();
     encPass_ = ComputePass{};
     blitPass_ = ComputePass{};hdrVideoSrPass_={};srPrescalePass_={};srResolvePass_={};firstSrRestorePass_={};

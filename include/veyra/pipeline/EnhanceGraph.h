@@ -1014,6 +1014,13 @@ private:
     // for the forward-backward check (same VEYRA_TEST_FLOW_CONSISTENCY switch).
     bool flowClaims_=false;
     ComPtr<ID3D12Resource> fgFlowClaims_,fgFlowAgreement_;
+    // Experimental (VEYRA_TEST_FSR_FLOW_DEPTH=1): FSR frame generation receives a coarse
+    // foreground/background depth from the FG motion (FsrFlowDepth.hlsl) instead of the
+    // constant depthTex_. Off by default; other FG backends always keep depthTex_.
+    bool fsrFlowDepth_=false,fsrFlowDepthLogged_=false;
+    ComPtr<ID3D12Resource> fsrFlowDepthTex_,fsrDepthHistogram_,fsrDepthDominant_;
+    ComputePass fsrFlowDepthPass_;
+    ID3D12Resource* fsrFlowDepthMotion() const { return flowRefine_?fgBaseFlow_.Get():baseFlow_.Get(); }
     uint64_t motionPreviousSource_[2]={},previousSource_=0;
     ComPtr<ID3D12Resource> proxyTex_;
     ComPtr<ID3D12Resource> neuralTex_;
