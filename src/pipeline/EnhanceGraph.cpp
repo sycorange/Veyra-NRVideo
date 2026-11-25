@@ -863,6 +863,19 @@ bool EnhanceGraph::initialize(const EnhanceGraphDesc& desc)
     if(context_.adapter().vendorId==0x1002 && desc_.opticalFlowBackend==engine::OpticalFlowBackend::Nvidia)
         desc_.opticalFlowBackend=engine::OpticalFlowBackend::AmdFidelityFx;
     if(desc_.opticalFlowBackend==engine::OpticalFlowBackend::AmdFidelityFx&&desc.amdFlowHalfResolution){nvofW_=std::max(1u,nvofW_/2);nvofH_=std::max(1u,nvofH_/2);}
+    // Experimental (VEYRA_TEST_AMD_FLOW_DOUBLE=1): FidelityFX flow on a 2x bilinear enlargement
+    // of the source. Its 8x8 blocks then cover 4x4 source pixels, so silhouettes get finer
+    // vectors (fewer blocks that mix a character with the background behind it). About 4x the
+    // flow cost; consumers already adapt flow-extent vectors to their own extent.
+    else if(desc_.opticalFlowBackend==engine::OpticalFlowBackend::AmdFidelityFx&&!desc.stillImage){
+        wchar_t doubleFlow[4]{};
+        if(GetEnvironmentVariableW(L"VEYRA_TEST_AMD_FLOW_DOUBLE",doubleFlow,4)>0&&doubleFlow[0]==L'1'){
+            if(nvofW_*2<=4096&&nvofH_*2<=2304){
+                nvofW_*=2;nvofH_*=2;
+                veyra::log::info("amd-of",std::format("double-resolution flow input={}x{} for source {}x{} (experimental, VEYRA_TEST_AMD_FLOW_DOUBLE=1)",nvofW_,nvofH_,srcW_,srcH_));
+            }else veyra::log::warn("amd-of",std::format("double-resolution flow skipped: {}x{} source exceeds the 4096x2304 limit",nvofW_,nvofH_));
+        }
+    }
     diagnostics::DiagnosticEvent initDiagnostic;initDiagnostic.stage="initialize";initDiagnostic.identity={epoch_+1,desc.settingsRevision,0};initDiagnostic.resolution.source={srcW_,srcH_};initDiagnostic.resolution.base=initDiagnostic.resolution.fg=initDiagnostic.resolution.output={workW_,workH_};initDiagnostic.resolution.nr={nrW_,nrH_};initDiagnostic.resolution.flow={nvofW_,nvofH_};initDiagnostic.flowApplied=std::to_string(unsigned(desc.flowQuality));initDiagnostic.runtimeHash="unverified-user-replaceable";Logger::diagnosticContext(initDiagnostic);
     veyra::log::info("resolution",std::format("source={}x{} base={}x{} nr={}x{} flow={}x{} fg={}x{} output={}x{}",srcW_,srcH_,workW_,workH_,nrW_,nrH_,nvofW_,nvofH_,workW_,workH_,workW_,workH_));
     veyra::log::info("pipeline-order",desc.splitNrAcrossSr()?"NR(source) -> SR -> NR(work) -> FG (node preview)":desc.nrBeforeSr?"NR -> residual(source) -> SR -> FG (experimental preview)":"SR -> NR -> residual -> FG");

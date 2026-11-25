@@ -41,3 +41,13 @@ readback and no CPU wait.
   between frames.
 - Validated only by compilation in CI at the time of writing. Image-quality results need
   side-by-side captures (on/off) on real 30→60 content.
+
+## Related experiment: double-resolution FidelityFX flow
+
+`VEYRA_TEST_AMD_FLOW_DOUBLE=1` (off by default) runs FidelityFX optical flow on a 2×
+bilinear enlargement of the source, so its 8×8 blocks cover 4×4 source pixels. It targets
+blocky frame-generation tears at silhouettes during camera turns (a head edge taking the
+background's vector and showing the background through it). This was reproduced on 2.2.1
+with FSR 4 FG on 1080p capture whether depth or Edge Aegis was on or off. It costs about 4× the flow
+work. It doesn't apply with AMD half-resolution flow or still images, or past a 4096×2304
+flow extent.
