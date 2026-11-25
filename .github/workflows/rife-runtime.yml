@@ -1,0 +1,72 @@
+name: RIFE runtime folder (fork test helper)
+
+# Fork-only helper, not for upstream: assembles the runtime/rife folder that
+# docs/RIFE_DIRECTML.md describes, from the sources it names, so a tester can
+# unzip it next to veyra_qml_ui.exe. Nothing here is committed to the repository.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/rife-runtime.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  assemble:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        with:
+          persist-credentials: false
+
+      - name: Fetch ONNX Runtime DirectML 1.24.4 and DirectML 1.15.4 (NuGet)
+        run: |
+          set -euo pipefail
+          mkdir -p dl out/rife
+          curl -fsSL -o dl/ort.nupkg https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime.directml/1.24.4/microsoft.ml.onnxruntime.directml.1.24.4.nupkg
+          curl -fsSL -o dl/dml.nupkg https://api.nuget.org/v3-flatcontainer/microsoft.ai.directml/1.15.4/microsoft.ai.directml.1.15.4.nupkg
+          unzip -q dl/ort.nupkg -d dl/ort
+          unzip -q dl/dml.nupkg -d dl/dml
+          cp dl/ort/runtimes/win-x64/native/onnxruntime.dll out/rife/
+          cp dl/ort/runtimes/win-x64/native/onnxruntime_providers_shared.dll out/rife/
+          cp dl/dml/bin/x64-win/DirectML.dll out/rife/
+          # Licence texts travel with the binaries.
+          find dl/ort -maxdepth 1 -iname 'LICENSE*' -exec cp {} out/rife/ONNXRUNTIME-LICENSE.txt \;
+          find dl/ort -maxdepth 1 -iname 'ThirdPartyNotices*' -exec cp {} out/rife/ONNXRUNTIME-ThirdPartyNotices.txt \;
+          find dl/dml -maxdepth 1 -iname 'LICENSE*' -exec cp {} out/rife/DIRECTML-LICENSE.txt \;
+
+      - name: Fetch the Practical-RIFE exports (vs-mlrt external-models)
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -q p7zip-full > /dev/null
+          for m in rife_v4.26 rife_v4.22_lite; do
+            curl -fsSL -o "dl/$m.7z" "https://github.com/AmusementClub/vs-mlrt/releases/download/external-models/$m.7z"
+            7z x -y -odl/models "dl/$m.7z" > /dev/null
+          done
+          find dl/models -name '*.onnx' | sort
+
+      - name: Convert the models (tools/rife_models/make_rife_models.py)
+        run: |
+          set -euo pipefail
+          python3 -m venv venv
+          venv/bin/pip install -q onnx onnxruntime sympy
+          venv/bin/python tools/rife_models/make_rife_models.py dl/models out/rife
+
+      - name: Manifest
+        run: |
+          set -euo pipefail
+          cd out/rife
+          sha256sum * | tee SHA256SUMS.txt
+          ls -la
+          for f in onnxruntime.dll DirectML.dll rife_v4.26_fp16.onnx rife_v4.22_lite_fp16.onnx; do
+            test -s "$f" || { echo "missing $f"; exit 1; }
+          done
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: veyra-rife-runtime
+          path: out
+          if-no-files-found: error
