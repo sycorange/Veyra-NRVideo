@@ -9,6 +9,7 @@ on:
   push:
     paths:
       - 'shaders/FgStaticRepair.hlsl'
+      - 'shaders/FgPairChange.hlsl'
       - '.github/workflows/shader-quick.yml'
 
 permissions:
@@ -22,7 +23,7 @@ jobs:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
         with:
           persist-credentials: false
-      - name: Compile FgStaticRepair
+      - name: Compile the experimental repair shaders
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -30,9 +31,11 @@ jobs:
           if (-not $dxc) { throw 'dxc.exe not found under the Windows Kits' }
           Write-Host "dxc: $($dxc.FullName)"
           New-Item -ItemType Directory -Force out | Out-Null
-          & $dxc.FullName -T cs_6_0 -E main -O3 -Qstrip_debug -Qstrip_reflect -Fo out\FgStaticRepair.dxil shaders\FgStaticRepair.hlsl
-          if ($LASTEXITCODE -ne 0) { throw "dxc failed with exit code $LASTEXITCODE" }
-          Get-FileHash out\FgStaticRepair.dxil -Algorithm SHA256 | Format-List
+          foreach ($name in 'FgStaticRepair', 'FgPairChange') {
+            & $dxc.FullName -T cs_6_0 -E main -O3 -Qstrip_debug -Qstrip_reflect -Fo "out\$name.dxil" "shaders\$name.hlsl"
+            if ($LASTEXITCODE -ne 0) { throw "dxc failed on $name with exit code $LASTEXITCODE" }
+            Get-FileHash "out\$name.dxil" -Algorithm SHA256 | Format-List
+          }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: veyra-repair-shader
