@@ -51,3 +51,13 @@ background's vector and showing the background through it). This was reproduced 
 with FSR 4 FG on 1080p capture whether depth or Edge Aegis was on or off. It costs about 4× the flow
 work. It doesn't apply with AMD half-resolution flow or still images, or past a 4096×2304
 flow extent.
+
+## Related experiment: static repair of generated frames
+
+`VEYRA_TEST_FG_STATIC_REPAIR=1` (off by default; `2` also tints repaired pixels) runs
+`shaders/FgStaticRepair.hlsl` on each FSR-generated frame: where the two real frames agree
+with each other in a 3×3 tap neighbourhood but the generated frame differs, the pixel takes
+the real frames' average. It targets a screen-still third-person character losing parts of
+its outline to the background during 30 fps camera turns, which FSR 4 ML, RIFE 4.26 and AMD
+FRC all showed on the same capture. SDR output and FSR graph FG only. Known limit: objects
+smaller than their per-frame displacement over plain areas are removed from generated frames.

@@ -1021,6 +1021,14 @@ private:
     ComPtr<ID3D12Resource> fsrFlowDepthTex_,fsrDepthHistogram_,fsrDepthDominant_;
     ComputePass fsrFlowDepthPass_;
     ID3D12Resource* fsrFlowDepthMotion() const { return flowRefine_?fgBaseFlow_.Get():baseFlow_.Get(); }
+    // Experimental (VEYRA_TEST_FG_STATIC_REPAIR=1, 2 = tint repaired pixels): an FSR-generated
+    // frame takes the two real frames' average where they agree with each other but not with
+    // it (FgStaticRepair.hlsl). SDR output only. 0 = off.
+    unsigned fgStaticRepair_=0;
+    bool fgStaticRepairLogged_=false;
+    ComPtr<ID3D12Resource> fgStaticRepairScratch_;
+    ComputePass fgStaticRepairPass_;
+    void composeStaticRepair(ID3D12GraphicsCommandList* list,unsigned generatedSlot,unsigned parity);
     uint64_t motionPreviousSource_[2]={},previousSource_=0;
     ComPtr<ID3D12Resource> proxyTex_;
     ComPtr<ID3D12Resource> neuralTex_;

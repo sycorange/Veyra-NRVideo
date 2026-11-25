@@ -425,6 +425,8 @@ veyra_add_compute_shader(veyra_shader_flow_fill FlowFill)
 veyra_add_compute_shader(veyra_shader_flow_claim FlowClaim)
 # Experimental FSR depth from FG motion (VEYRA_TEST_FSR_FLOW_DEPTH=1).
 veyra_add_compute_shader(veyra_shader_fsr_flow_depth FsrFlowDepth)
+# Experimental generated-frame repair where both real frames agree (VEYRA_TEST_FG_STATIC_REPAIR=1).
+veyra_add_compute_shader(veyra_shader_fg_static_repair FgStaticRepair)
 # VfgShotChange: per-pair shot-change test for VFG (replaces the SDK's automatic one).
 veyra_add_compute_shader(veyra_shader_vfg_shot_change VfgShotChange)
 # RIFE (RifeDmlBackend): colour <-> planar model tensors.
