@@ -61,3 +61,13 @@ the real frames' average. It targets a screen-still third-person character losin
 its outline to the background during 30 fps camera turns, which FSR 4 ML, RIFE 4.26 and AMD
 FRC all showed on the same capture. SDR output and FSR graph FG only. Known limit: objects
 smaller than their per-frame displacement over plain areas are removed from generated frames.
+
+## Related experiment: per-region pair check
+
+`VEYRA_TEST_FG_PAIR_CHECK=1` (off by default) runs `shaders/FgPairChange.hlsl` per real
+frame: 16×8 blocks of a 128×72 luma picture of the previous real frame are matched in the
+current one within ±24 × ±10 luma pixels. Where a block has no match, the compose pass shows
+the current real frame instead of the generated one. Observed case: a character sweeping
+past the camera during a spin, where FSR 4 ML produced a see-through blend of two unrelated
+pictures. Thresholds are untuned; fast motion beyond the search range also falls back to
+the real frame.

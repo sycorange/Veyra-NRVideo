@@ -1028,6 +1028,12 @@ private:
     bool fgStaticRepairLogged_=false;
     ComPtr<ID3D12Resource> fgStaticRepairScratch_;
     ComputePass fgStaticRepairPass_;
+    // Experimental (VEYRA_TEST_FG_PAIR_CHECK=1): per-region match of the previous real frame
+    // in the current one (FgPairChange.hlsl); the same compose pass shows the current real
+    // frame where there is none.
+    bool fgPairCheck_=false;
+    ComPtr<ID3D12Resource> fgPairLuma_,fgPairError_;
+    ComputePass fgPairPass_;
     void composeStaticRepair(ID3D12GraphicsCommandList* list,unsigned generatedSlot,unsigned parity);
     uint64_t motionPreviousSource_[2]={},previousSource_=0;
     ComPtr<ID3D12Resource> proxyTex_;

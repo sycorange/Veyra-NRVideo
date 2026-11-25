@@ -1,2 +1,3 @@
 fork test build trigger (drop before any pull request)
 build 6: static repair
+build 7: pair check
