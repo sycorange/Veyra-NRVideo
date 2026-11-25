@@ -124,7 +124,8 @@ jobs:
           # --classic: vcpkg.json in the repo root would otherwise force manifest mode.
           C:\v\vcpkg.exe install --classic --overlay-ports=C:\vcpkg-overlay --clean-after-build `
             'ffmpeg[core,avcodec,avformat,avfilter,swresample,swscale,dav1d,zlib]:x64-windows' `
-            'libass:x64-windows-static'
+            'libass:x64-windows-static' `
+            'openssl:x64-windows-static'
           $list = C:\v\vcpkg.exe list --classic
           $list | Set-Content -Encoding utf8 C:\vcpkg-list.txt
           $list | Write-Host
@@ -146,6 +147,8 @@ jobs:
             -DVEYRA_FFMPEG_ROOT=C:/v/installed/x64-windows `
             -DVEYRA_LIBASS_ROOT=C:/v/installed/x64-windows-static `
             -DVEYRA_LIBDOVI_ROOT=C:/dovi `
+            -DOPENSSL_USE_STATIC_LIBS=TRUE -DOPENSSL_MSVC_STATIC_RT=TRUE `
+            -DOPENSSL_ROOT_DIR=C:/v/installed/x64-windows-static `
             "-DCMAKE_PREFIX_PATH=$env:QT_ROOT_DIR"
 
       - name: Build veyra_qml_ui, virtual camera and shaders
