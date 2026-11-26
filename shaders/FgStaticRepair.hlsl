@@ -1,6 +1,7 @@
 // FgStaticRepair: experimental repair of a generated frame where both real frames agree
 // (VEYRA_TEST_FG_STATIC_REPAIR=1; 2 also tints the result for inspection: pink = repaired,
-// cyan = static evidence but left alone as a thin object over a plain area, green = filled,
+// orange = repaired because it touches intact static foreground, cyan = static evidence but
+// left alone, green = filled,
 // yellow = real frame shown by the pair check).
 //
 // On 30 fps capture a camera turn moves the background far between two real frames while
@@ -74,6 +75,8 @@ static const float kMoveLow = 0.05;      // "is moving background" mismatch wher
 static const float kMoveHigh = 0.10;     // and where the pixel is surely not moving background
 static const float kLegitLow = 0.04;     // generated content matches both real frames up to here: keep it
 static const float kLegitHigh = 0.08;    // from here on it is explained by neither
+
+static const float kAnchorsNeeded = 2.0;  // intact static neighbours (of 16) where the rescue starts; two more complete it
 
 static const float kPairLow = 0.09;      // block best-match error where the real frame starts to show
 static const float kPairHigh = 0.15;     // and where it fully replaces the generated frame
@@ -150,13 +153,16 @@ void main(uint3 id : SV_DispatchThreadID)
     differ /= 9.0;
     const float evidence = repairOn < 0.5 ? 0.0 : (1.0 - smoothstep(kStaticLow, kStaticHigh, still)) * smoothstep(kDifferLow, kDifferHigh, differ - 1.5 * still);
     float w = 0;
+    float rescued = 0;
     if (evidence > 0) {
         float notBackground = 0;   // largest mismatch of "the content here moves with a nearby motion"
         float explained = 1.0;     // smallest two-sided error of the generated content along a motion
+        float2 longest = float2(0, 0);
         [loop] for (int k = 0; k < 9; ++k) {
             const int2 q = k == 0 ? p : clamp(p + kRing[max(k - 1, 0)] * step * 3 / 2, int2(0, 0), limit);
             const float2 m = motionTex[q];
             if (!all(isfinite(m)) || length(m) < kMinMotion * float(step)) continue;
+            if (dot(m, m) > dot(longest, longest)) longest = m;
             const int2 fullMove = int2(round(m));
             const int2 halfMove = int2(round(0.5 * m));
             notBackground = max(notBackground, max(patchDiff(currentTex, p, previousTex, p + fullMove, step, limit),
@@ -167,14 +173,40 @@ void main(uint3 id : SV_DispatchThreadID)
                                        patchDiff(generatedTex, p, currentTex, p + halfMove, step, limit));
             explained = min(explained, min(forward, backward));
         }
-        w = evidence * smoothstep(kMoveLow, kMoveHigh, notBackground) * smoothstep(kLegitLow, kLegitHigh, explained);
+        const float base = evidence * smoothstep(kMoveLow, kMoveHigh, notBackground);
+        w = base * smoothstep(kLegitLow, kLegitHigh, explained);
+        // A pixel the motion test would leave alone is still repaired when it touches intact
+        // static foreground: nearby pixels that are static in the real frames, are drawn the
+        // same in the generated frame, have (almost) no motion of their own and cannot be
+        // background moving by the longest nearby motion. A torn head keeps such pixels just
+        // inside the tear; a lane line on the road has none.
+        if (base > w) {
+            const float reach = length(longest);
+            const int2 longMove = int2(round(longest));
+            float anchors = 0;
+            [loop] for (int a = 0; a < 16; ++a) {
+                const int2 q = p + kRing[a & 7] * step * (a < 8 ? 3 : 9) / 4;
+                if (any(q < int2(0, 0)) || any(q > limit)) continue;
+                const float2 f = motionTex[q];
+                if (!all(isfinite(f)) || length(f) > 0.25 * reach) continue;
+                const float intact = 1.0 - smoothstep(kStaticLow, kStaticHigh, patchDiff(generatedTex, q, previousTex, q, step, limit));
+                if (intact <= 0.0) continue;
+                anchors += intact * staticForeground(q, longMove, step, limit);
+            }
+            rescued = (base - w) * saturate((anchors - kAnchorsNeeded + 1.0) * 0.5);
+            w += rescued;
+        }
     }
     float fill = 0;
     float3 fillColor = g.rgb;
     const float moving = fillOn < 0.5 ? 0.0 : smoothstep(kStaticLow, kStaticHigh, still);
     if (moving > 0) {
-        [loop] for (int n = 0; n < 9; ++n) {
-            const int2 q = n == 0 ? p : clamp(p + kRing[max(n - 1, 0)] * step * 3 / 2, int2(0, 0), limit);
+        // Candidate motions: the pixel's own, a ring at 15 spacings and a ring at 45. The far
+        // ring is for the strip where background comes out from behind the object: that
+        // background has no match in the previous frame, so the motion inside the strip is
+        // unreliable and has to come from beyond it.
+        [loop] for (int n = 0; n < 17; ++n) {
+            const int2 q = n == 0 ? p : clamp(p + kRing[max(n - 1, 0) & 7] * step * (n < 9 ? 3 : 9) / 2, int2(0, 0), limit);
             const float2 m = motionTex[q];
             if (!all(isfinite(m))) continue;
             const float len = length(m);
@@ -215,8 +247,9 @@ void main(uint3 id : SV_DispatchThreadID)
     const float replaced = pairOn < 0.5 ? 0.0 : smoothstep(kPairLow, kPairHigh, pairError(p));
     result = lerp(result, currentTex[p].rgb, replaced);
     if (debugView != 0) {
-        result = lerp(result, float3(1.0, 0.0, 1.0), 0.6 * w);
+        result = lerp(result, float3(1.0, 0.0, 1.0), 0.6 * (w - rescued));
         result = lerp(result, float3(0.0, 1.0, 1.0), 0.6 * (evidence - w));
+        result = lerp(result, float3(1.0, 0.5, 0.0), 0.6 * rescued);
         result = lerp(result, float3(0.0, 1.0, 0.0), 0.6 * fill);
         result = lerp(result, float3(1.0, 1.0, 0.0), 0.4 * replaced);
     }
