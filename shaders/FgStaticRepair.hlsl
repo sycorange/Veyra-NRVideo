@@ -1,7 +1,7 @@
 // FgStaticRepair: experimental repair of a generated frame where both real frames agree
 // (VEYRA_TEST_FG_STATIC_REPAIR=1; 2 also tints the result for inspection: pink = repaired,
-// orange = repaired because it touches intact static foreground, cyan = static evidence but
-// left alone, green = filled,
+// orange = repaired because it touches intact static foreground, cyan = static evidence that was
+// left alone, green = filled by the occlusion fill,
 // yellow = real frame shown by the pair check).
 //
 // On 30 fps capture a camera turn moves the background far between two real frames while
